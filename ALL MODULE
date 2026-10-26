@@ -1,0 +1,574 @@
+----- ALL VERILOG MODULES -----
+
+---CORE / TOP MODULE---
+`timescale 1ns / 1ps
+
+module risc8_5stage_core(
+    input wire clk,
+    input wire rst
+);
+
+    // =========================================================================
+    // 0. GLOBAL DECLARATIONS
+    // =========================================================================
+    reg  [7:0] pc;
+    wire [7:0] next_pc;
+    wire [15:0] if_instr;
+    
+    reg [15:0] id_instr;
+    reg [7:0]  id_pc;
+    
+    wire [3:0] id_opcode = id_instr[15:12];
+    wire [2:0] id_rd     = id_instr[11:9];
+    wire [7:0] id_imm8   = id_instr[7:0];
+    
+    wire [2:0] id_ALU_opcode;
+    wire id_FlagsCZ_WrEn, id_ALU_B_ImmediatePass, id_Using_A, id_Using_B;
+    wire id_Read_A_FromRD, id_Read_B_FromRD, id_Register_WrBackEn;
+    wire id_DMem_WrEn, id_WriteBack_From_AluOrMemory;
+    wire id_Branch_IfZero, id_Branch_IfnotZero, id_JMP, id_HALT;
+
+    wire [2:0] id_rs1_addr = id_Read_A_FromRD ? id_rd : id_instr[8:6];
+    wire [2:0] id_rs2_addr = id_Read_B_FromRD ? id_rd : id_instr[5:3];
+    wire [7:0] id_read_a_data;
+    wire [7:0] id_read_b_data;
+
+    // FIX 2: Intercepting LD (4'hA) and ST (4'hB) to force the ALU to use the Immediate (00)
+    wire is_ld_st = (id_opcode == 4'hA) || (id_opcode == 4'hB);
+    wire corrected_ALU_B_ImmediatePass = id_ALU_B_ImmediatePass || is_ld_st;
+
+    reg [2:0] ex_ALU_opcode;
+    reg ex_FlagsCZ_WrEn, ex_ALU_B_ImmediatePass, ex_Using_A, ex_Using_B;
+    reg ex_Register_WrBackEn, ex_DMem_WrEn, ex_WriteBack_From_AluOrMemory;
+    reg ex_Branch_IfZero, ex_Branch_IfnotZero, ex_JMP, ex_HALT;
+    reg [7:0] ex_reg_a, ex_reg_b, ex_imm8, ex_pc;
+    reg [2:0] ex_rd, ex_rs1_addr, ex_rs2_addr;
+    
+    wire stall; 
+    wire [1:0] fwd_a_sel, fwd_b_sel;
+    wire [7:0] ex_alu_result;
+    wire ex_CarryBitFlag, ex_Zero_Flag;
+    wire ex_Branch_Taken;
+    reg saved_carry_flag, saved_zero_flag;
+    
+    reg mem_Register_WrBackEn, mem_DMem_WrEn, mem_WriteBack_From_AluOrMemory;
+    reg [7:0] mem_alu_result, mem_write_data;
+    reg [2:0] mem_rd;
+    
+    wire [7:0] mem_read_data;
+    
+    reg wb_Register_WrBackEn, wb_WriteBack_From_AluOrMemory;
+    reg [7:0] wb_alu_result, wb_mem_data;
+    reg [2:0] wb_rd;
+    
+    wire [7:0] wb_final_data;
+
+    // =========================================================================
+    // 1. COMBINATIONAL ROUTING
+    // =========================================================================
+    
+    // FIX 1: Branches now correctly evaluate the SAVED flag from the Status Register
+    assign ex_Branch_Taken = (ex_Branch_IfZero && saved_zero_flag) || 
+                             (ex_Branch_IfnotZero && !saved_zero_flag);
+                             
+    assign next_pc = (ex_JMP || ex_Branch_Taken) ? ex_imm8 : (pc + 1);
+    
+    assign wb_final_data = wb_WriteBack_From_AluOrMemory ? wb_mem_data : wb_alu_result;
+    
+    wire [7:0] alu_input_a = (fwd_a_sel == 2'b10) ? mem_alu_result :
+                             (fwd_a_sel == 2'b01) ? wb_final_data : ex_reg_a;
+                             
+    wire [7:0] fwd_input_b = (fwd_b_sel == 2'b10) ? mem_alu_result :
+                             (fwd_b_sel == 2'b01) ? wb_final_data : ex_reg_b;
+                             
+    wire [7:0] alu_input_b = ex_ALU_B_ImmediatePass ? ex_imm8 : fwd_input_b;
+
+    // =========================================================================
+    // 2. MODULE INSTANTIATIONS & PIPELINE REGISTERS
+    // =========================================================================
+    always @(posedge clk) begin
+        if (rst) 
+            pc <= 8'h00;
+        else if (!stall) 
+            pc <= next_pc; 
+    end
+
+    Instruction_Mem imem (
+        .addr(pc),
+        .instruction(if_instr)
+    );
+
+    always @(posedge clk) begin
+        if (rst || (ex_JMP || ex_Branch_Taken)) begin 
+            id_instr <= 16'h0000;
+            id_pc    <= 8'h00;
+        end else if (!stall) begin
+            id_instr <= if_instr;
+            id_pc    <= pc;
+        end
+    end
+
+    Control_Unit cu (
+        .opcode(id_opcode),
+        .ALU_opcode(id_ALU_opcode),
+        .FlagsCZ_WrEn(id_FlagsCZ_WrEn),
+        .ALU_B_ImmediatePass(id_ALU_B_ImmediatePass),
+        .Using_A(id_Using_A),
+        .Using_B(id_Using_B),
+        .Read_A_FromRD(id_Read_A_FromRD),
+        .Read_B_FromRD(id_Read_B_FromRD),
+        .Register_WrBackEn(id_Register_WrBackEn),
+        .DMem_WrEn(id_DMem_WrEn),
+        .WriteBack_From_AluOrMemory(id_WriteBack_From_AluOrMemory),
+        .Branch_IfZero(id_Branch_IfZero),
+        .Branch_IfnotZero(id_Branch_IfnotZero),
+        .JMP(id_JMP),
+        .HALT(id_HALT)
+    );
+
+    Registers_File regfile (
+        .clk(clk),
+        .rst(rst),
+        .Read_Addr_A(id_rs1_addr),
+        .Read_A_Data(id_read_a_data),
+        .Read_Addr_B(id_rs2_addr),
+        .Read_B_Data(id_read_b_data),
+        .Write_En(wb_Register_WrBackEn),   
+        .Write_Addr(wb_rd),                
+        .Write_Data(wb_final_data)         
+    );
+
+    always @(posedge clk) begin
+        if (rst || stall || ex_JMP || ex_Branch_Taken) begin 
+            ex_ALU_opcode              <= 3'd0;
+            ex_ALU_B_ImmediatePass     <= 0;
+            ex_Using_A                 <= 0;
+            ex_Using_B                 <= 0;
+            ex_Register_WrBackEn       <= 0;
+            ex_DMem_WrEn               <= 0;
+            ex_WriteBack_From_AluOrMemory <= 0;
+            ex_Branch_IfZero           <= 0;
+            ex_Branch_IfnotZero        <= 0;
+            ex_JMP                     <= 0;
+            ex_HALT                    <= 0;
+            ex_FlagsCZ_WrEn            <= 0;
+            
+            ex_reg_a    <= 8'h00;
+            ex_reg_b    <= 8'h00;
+            ex_imm8     <= 8'h00;
+            ex_pc       <= 8'h00;
+            ex_rd       <= 3'd0;
+            ex_rs1_addr <= 3'd0;
+            ex_rs2_addr <= 3'd0;
+        end else begin
+            ex_ALU_opcode              <= id_ALU_opcode;
+            ex_ALU_B_ImmediatePass     <= corrected_ALU_B_ImmediatePass; // Using the intercepted fix
+            ex_Using_A                 <= id_Using_A;
+            ex_Using_B                 <= id_Using_B;
+            ex_Register_WrBackEn       <= id_Register_WrBackEn;
+            ex_DMem_WrEn               <= id_DMem_WrEn;
+            ex_WriteBack_From_AluOrMemory <= id_WriteBack_From_AluOrMemory;
+            ex_Branch_IfZero           <= id_Branch_IfZero;
+            ex_Branch_IfnotZero        <= id_Branch_IfnotZero;
+            ex_JMP                     <= id_JMP;
+            ex_HALT                    <= id_HALT;
+            ex_FlagsCZ_WrEn            <= id_FlagsCZ_WrEn;
+            
+            ex_reg_a    <= id_read_a_data;
+            ex_reg_b    <= id_read_b_data;
+            ex_imm8     <= id_imm8;
+            ex_pc       <= id_pc;
+            ex_rd       <= id_rd;
+            ex_rs1_addr <= id_rs1_addr;
+            ex_rs2_addr <= id_rs2_addr;
+        end
+    end
+
+    ALU alu (
+        .a(alu_input_a),
+        .b(alu_input_b),
+        .opcode(ex_ALU_opcode),
+        .result(ex_alu_result),
+        .CarryBitFlag(ex_CarryBitFlag),
+        .Zero_Flag(ex_Zero_Flag)
+    );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            saved_carry_flag <= 0;
+            saved_zero_flag  <= 0;
+        end else if (ex_FlagsCZ_WrEn) begin
+            saved_carry_flag <= ex_CarryBitFlag;
+            saved_zero_flag  <= ex_Zero_Flag;
+        end
+    end
+
+    Hazard_Unit hu (
+        .id_valid(1'b1),               
+        .id_ra_addr(id_rs1_addr),
+        .id_rb_addr(id_rs2_addr),
+        .id_uses_a(id_Using_A),
+        .id_uses_b(id_Using_B),
+        
+        .ex_valid(1'b1),
+        .ex_mem_to_reg(ex_WriteBack_From_AluOrMemory),
+        .ex_rd(ex_rd),
+        .ex_ra_addr(ex_rs1_addr),
+        .ex_rb_addr(ex_rs2_addr),
+        .ex_uses_a(ex_Using_A),
+        .ex_uses_b(ex_Using_B),
+        
+        .mem_reg_we(mem_Register_WrBackEn),
+        .mem_mem_to_reg(mem_WriteBack_From_AluOrMemory),
+        .mem_rd(mem_rd),
+        
+        .wb_reg_we(wb_Register_WrBackEn),
+        .wb_rd(wb_rd),
+        
+        .fwd_a_sel(fwd_a_sel),
+        .fwd_b_sel(fwd_b_sel),
+        .stall(stall)
+    );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            mem_Register_WrBackEn          <= 0;
+            mem_DMem_WrEn                  <= 0;
+            mem_WriteBack_From_AluOrMemory <= 0;
+            mem_alu_result                 <= 8'h00;
+            mem_write_data                 <= 8'h00;
+            mem_rd                         <= 3'd0;
+        end else begin
+            mem_Register_WrBackEn          <= ex_Register_WrBackEn;
+            mem_DMem_WrEn                  <= ex_DMem_WrEn;
+            mem_WriteBack_From_AluOrMemory <= ex_WriteBack_From_AluOrMemory;
+            mem_alu_result                 <= ex_alu_result;
+            mem_write_data                 <= fwd_input_b; 
+            mem_rd                         <= ex_rd;
+        end
+    end
+
+    Data_Mem dmem (
+        .clk(clk),
+        .Write_En(mem_DMem_WrEn),
+        .addr(mem_alu_result),
+        .Write_Data(mem_write_data),
+        .Read_Data(mem_read_data)
+    );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_Register_WrBackEn          <= 0;
+            wb_WriteBack_From_AluOrMemory <= 0;
+            wb_alu_result                 <= 8'h00;
+            wb_mem_data                   <= 8'h00;
+            wb_rd                         <= 3'd0;
+        end else begin
+            wb_Register_WrBackEn          <= mem_Register_WrBackEn;
+            wb_WriteBack_From_AluOrMemory <= mem_WriteBack_From_AluOrMemory;
+            wb_alu_result                 <= mem_alu_result;
+            wb_mem_data                   <= mem_read_data;
+            wb_rd                         <= mem_rd;
+        end
+    end
+
+endmodule
+
+
+
+---INSTRUCTION MEMORY---
+`timescale 1ns / 1ps
+
+module Instruction_Mem #(
+ parameter INIT_FILE =  "program.hex") 
+    (
+ input wire [7:0] addr,            // address from PC
+ output wire [15:00] instruction   // the instruction at that address
+    );
+ reg [15:00] ROM [255:0]; // 256 instructions
+ integer i;
+    
+    initial begin
+    for (i=0 ; i < 256 ; i = i + 1)
+        ROM[i] = 16'h0000;
+    $readmemh(INIT_FILE, ROM);
+    end
+ 
+  assign instruction = ROM[addr]; // address from PC will run through the 256 ROM slots to output our desired instruction
+endmodule
+
+
+
+---CONTROL UNIT---
+`timescale 1ns / 1ps
+
+module Control_Unit(
+    input  wire  [3:0] opcode,      // Opcode as input, the Control Unit will decode this and enables the right signal
+    
+    output reg [2:0] ALU_opcode,    // Opcode for ALU, sending the right signal to the ALU for the right operation
+    output reg FlagsCZ_WrEn,  
+    output reg ALU_B_ImmediatePass,
+    
+    output reg Using_A,
+    output reg Using_B,
+    output reg Read_A_FromRD,
+    output reg Read_B_FromRD,
+    output reg Register_WrBackEn,
+    
+    output reg DMem_WrEn,
+    output reg WriteBack_From_AluOrMemory,
+ 
+    output reg Branch_IfZero,
+    output reg Branch_IfnotZero,
+    output reg JMP,
+    output reg HALT
+    );
+
+localparam OP_NOP=4'h0, 
+           
+           OP_ADD=4'h1, 
+           OP_SUB=4'h2, 
+           
+           OP_AND=4'h3, 
+           OP_OR=4'h4, 
+           OP_XOR=4'h5,
+           
+           OP_SHL=4'h6, 
+           OP_SHR=4'h7, 
+           
+           OP_LDI=4'h8, 
+           OP_ADDI=4'h9, 
+           OP_LD=4'hA, 
+           OP_ST=4'hB,
+               
+           OP_JMP=4'hC, 
+           OP_BZ=4'hD, 
+           OP_BNZ=4'hE, 
+           OP_HLT=4'hF;
+               
+    always @(*) begin
+        // set all 14 outputs to 0 
+        ALU_opcode = 3'd0; 
+        FlagsCZ_WrEn = 0; 
+        ALU_B_ImmediatePass = 0;
+        
+        Using_A = 0; 
+        Using_B = 0; 
+        Register_WrBackEn = 0;
+        Read_A_FromRD = 0; 
+        Read_B_FromRD = 0; 
+        
+        DMem_WrEn = 0; 
+        WriteBack_From_AluOrMemory = 0;
+        
+        Branch_IfZero = 0; 
+        Branch_IfnotZero = 0; 
+        JMP = 0; 
+        HALT = 0;
+        
+     case (opcode)  // decoding opcode and sending signals
+            OP_ADD : begin ALU_opcode = 3'd0; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_SUB : begin ALU_opcode = 3'd1; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            
+            OP_AND : begin ALU_opcode = 3'd2; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_OR  : begin ALU_opcode = 3'd3; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_XOR : begin ALU_opcode = 3'd4; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+
+            OP_SHL : begin ALU_opcode = 3'd5; Using_A = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_SHR : begin ALU_opcode = 3'd6; Using_A = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+
+            OP_LDI : begin ALU_opcode = 3'd7; ALU_B_ImmediatePass = 1; Register_WrBackEn = 1; end
+            OP_ADDI: begin ALU_opcode = 3'd0; ALU_B_ImmediatePass = 1; Read_A_FromRD = 1; Using_A = 1;
+                           Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_LD  : begin Using_A = 1; Register_WrBackEn = 1; WriteBack_From_AluOrMemory = 1; end
+            OP_ST  : begin Using_A = 1; Using_B = 1; Read_B_FromRD = 1; DMem_WrEn = 1; end
+
+            OP_JMP : JMP = 1;
+            OP_BZ  : Branch_IfZero = 1;
+            OP_BNZ : Branch_IfnotZero = 1;
+            OP_HLT : HALT = 1;
+
+            OP_NOP : ;
+            default: ;   // all 16 opcodes are listed, so never used
+        endcase
+    end
+       
+endmodule
+
+
+
+---REGISTER FILE--- 
+`timescale 1ns / 1ps
+
+module Registers_File(
+    input wire clk, // Clock
+    input wire rst, // Reset
+    input wire  [2:0]  Read_Addr_A, // Read the register's address for Operand A
+    output wire [7:0]  Read_A_Data, // Read the data inside the register for A
+    input wire  [2:0]  Read_Addr_B, // Read the register's address for Operand B
+    output wire [7:0]  Read_B_Data, // Read the data inside the register for B
+    input wire         Write_En,    // Enable writing into the Registers
+    input wire [2:0]   Write_Addr,  // Address of register desired to Write to
+    input wire [7:0]   Write_Data   // Data that will be written into desired register's address
+    );
+
+  reg [7:0] r [7:0]; // 8 registers each 8-bit wide
+  integer i;         // integer for clearing registers
+ 
+  always @(posedge clk) begin
+    if (rst) 
+     for (i=0 ; i < 8 ; i=i+1) r[i] <= 8'h00; // resetting registers
+    else if (Write_En)
+     r[Write_Addr] <= Write_Data; // writing into register
+  end
+
+ assign Read_A_Data = (Write_En && (Write_Addr == Read_Addr_A)) ? Write_Data : r[Read_Addr_A];
+ assign Read_B_Data = (Write_En && (Write_Addr == Read_Addr_B)) ? Write_Data : r[Read_Addr_B];
+
+endmodule
+
+
+
+---ALU---
+`timescale 1ns / 1ps
+
+module ALU(
+   input wire [7:0] a,       // Input A (Operand A)
+   input wire [7:0] b,       // Input B (Operand B)
+   input wire [2:0] opcode,  // Selected Operation
+   output reg [7:0] result,  // Result 
+   output reg CarryBitFlag,  // Carry bit wire, some operations also require an extra bit
+   output wire Zero_Flag     // Zero flag, raised when the result is 0
+    );
+localparam ALU_ADD       = 3'd0,  // Add
+           ALU_SUB       = 3'd1,  // Subtract
+           ALU_AND       = 3'd2,  // bitwise AND
+           ALU_OR        = 3'd3,  // bitwise OR
+           ALU_XOR       = 3'd4,  // bitwise XOR
+           ALU_SHL       = 3'd5,  // shift left 1 bit
+           ALU_SHR       = 3'd6,  // shift right 1 bit
+           ALU_BPASSTHRU = 3'd7;  // letting value pass straight through without any operation
+
+  always @(*) begin
+       CarryBitFlag = 1'b0;
+     case (opcode)
+       ALU_ADD       : {CarryBitFlag, result} = {1'b0, a} + {1'b0, b}; 
+       // {CarryBitFlag, result} concatenated in order to catch overflow bit
+       // I added one more bit to a and b to avoid Lint issues
+       ALU_SUB       : {CarryBitFlag, result} = {1'b0, a} - {1'b0, b};
+       ALU_AND       : result = a & b;
+       ALU_OR        : result = a | b;
+       ALU_XOR       : result = a ^ b;
+       ALU_SHL       : {CarryBitFlag, result} = {a, 1'b0};
+       ALU_SHR       : {result, CarryBitFlag} = {1'b0, a};
+       ALU_BPASSTHRU : result = b;
+      default: result = 8'h00;
+     endcase
+  end
+
+assign Zero_Flag = (result == 8'h00);
+    
+endmodule
+
+
+
+---HAZARD UNIT---
+`timescale 1ns / 1ps
+
+module Hazard_Unit(
+    // ---- Instruction in ID (Stage 2) : for load-use detection ----
+    input  wire       id_valid,      // IF/ID holds a real instruction
+    input  wire [2:0] id_ra_addr,    // register read on port A
+    input  wire [2:0] id_rb_addr,    // register read on port B
+    input  wire       id_uses_a,     // port A really used?
+    input  wire       id_uses_b,     // port B really used?
+
+    // ---- Instruction in EX (Stage 3) ----
+    input  wire       ex_valid,      // ID/EX holds a real instruction
+    input  wire       ex_mem_to_reg, // EX instruction is a load (LD)
+    input  wire [2:0] ex_rd,         // its destination register
+    input  wire [2:0] ex_ra_addr,    // registers it reads (for forwarding)
+    input  wire [2:0] ex_rb_addr,
+    input  wire       ex_uses_a,     // EX instruction really reads port A?
+    input  wire       ex_uses_b,     // EX instruction really reads port B?
+
+    // ---- Instruction in MEM (Stage 4) ----
+    input  wire       mem_reg_we,    // will write a register
+    input  wire       mem_mem_to_reg,// is a load (its data not ready in EX/MEM)
+    input  wire [2:0] mem_rd,
+
+    // ---- Instruction in WB (Stage 5) ----
+    input  wire       wb_reg_we,
+    input  wire [2:0] wb_rd,
+
+    // ---- Outputs ----
+    output reg  [1:0] fwd_a_sel,     // operand A source in EX
+    output reg  [1:0] fwd_b_sel,     // operand B source in EX
+    output wire       stall          // 1 = load-use stall this cycle
+);
+
+    
+    //    FORWARDING SELECT for operand A
+    //    Forward only if the EX instruction really reads port A
+    //    (ex_uses_a), so unused register fields never trigger it.
+    
+    always @(*) begin
+        if (ex_uses_a && mem_reg_we && !mem_mem_to_reg && (mem_rd == ex_ra_addr))
+            fwd_a_sel = 2'b10;          // newest value: from EX/MEM
+        else if (ex_uses_a && wb_reg_we && (wb_rd == ex_ra_addr))
+            fwd_a_sel = 2'b01;          // older value: from MEM/WB
+        else
+            fwd_a_sel = 2'b00;          // no hazard: use register value
+    end
+
+    
+    //  FORWARDING SELECT for operand B (same rules)
+    
+    always @(*) begin
+        if (ex_uses_b && mem_reg_we && !mem_mem_to_reg && (mem_rd == ex_rb_addr))
+            fwd_b_sel = 2'b10;
+        else if (ex_uses_b && wb_reg_we && (wb_rd == ex_rb_addr))
+            fwd_b_sel = 2'b01;
+        else
+            fwd_b_sel = 2'b00;
+    end
+
+    
+    //  LOAD-USE STALL
+    //  LD is in EX AND the instruction in ID reads LD's destination.
+    
+    assign stall = id_valid && ex_valid && ex_mem_to_reg &&
+                   ((id_uses_a && (id_ra_addr == ex_rd)) ||
+                    (id_uses_b && (id_rb_addr == ex_rd)));
+
+endmodule
+
+
+
+---DATA MEMORY---
+`timescale 1ns / 1ps
+
+module Data_Mem(
+    input  wire clk,               // Clock
+    input  wire Write_En,          // Write only when this line is 1 (enabled)
+    input  wire [7:0] addr,        // Address of data
+    input  wire [7:0] Write_Data,  // Data to write
+    output wire [7:0] Read_Data    // This line is to read data in whatever memory address we want to read
+    );
+    reg [7:0] mem [0:255];         
+    integer i;
+    
+    // Initialization, setting all the mem to 0
+    initial begin
+    for (i=0 ; i < 256; i = i + 1)
+      mem[i] = 8'h00;   // starting the data memory with nothing inside (initial state)
+    end
+    
+    // Write block
+    always @(posedge clk)
+      if (Write_En)
+        mem[addr] <= Write_Data;
+    // Read block 
+    assign Read_Data = mem[addr];      
+    
+endmodule
